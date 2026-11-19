@@ -1,0 +1,564 @@
+
+import random
+import string
+import time
+from flask import Flask, render_template_string
+from flask_socketio import SocketIO, join_room
+
+app = Flask(__name__)
+app.config["SECRET_KEY"] = "mafia-secret-2026"
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+rooms = {}
+COLORS = [
+    "#ff5252", "#448aff", "#69f0ae", "#ffd740",
+    "#e040fb", "#40c4ff", "#ffab40", "#b388ff",
+    "#64ffda", "#ff80ab", "#c6ff00", "#8c9eff",
+    "#ff6e40", "#84ffff", "#ea80fc", "#ccff90"
+]
+
+def get_room(code):
+    return rooms.get(code)
+
+def public_state(code):
+    room = get_room(code)
+    if not room:
+        return None
+
+    return {
+        "code": code,
+        "phase": room["phase"],
+        "round": room["round"],
+        "message": room["message"],
+        "deadline": room["deadline"],
+        "host": room["host"],
+        "players": [
+            {
+                "name": p["name"],
+                "color": p["color"],
+                "alive": p["alive"]
+            }
+            for p in room["players"].values()
+        ]
+    }
+
+def update_room(code):
+    room = get_room(code)
+    if not room:
+        return
+
+    for sid in room["players"]:
+        data = public_state(code)
+        data["is_host"] = sid == room["host"]
+        data["is_captain"] = sid == room["captain"]
+        socketio.emit("state", data, to=sid)
+
+def notice(sid, message):
+    socketio.emit("notice", message, to=sid)
+
+def private_role(sid, role):
+    socketio.emit("role", role, to=sid)
+
+def alive_players(room):
+    return [sid for sid, p in room["players"].items() if p["alive"]]
+
+def transfer_doctor(room):
+    candidates = [
+        p for p in room["players"].values()
+        if p["alive"] and p["role"] == "مواطن"
+    ]
+    if candidates:
+        new_doctor = random.choice(candidates)
+        new_doctor["role"] = "دكتور"
+        private_role(new_doctor["sid"], "دكتور")
+        return new_doctor["name"]
+    return None
+
+def eliminate(code, sid):
+    room = get_room(code)
+    if not room or sid not in room["players"]:
+        return None
+
+    player = room["players"][sid]
+    if not player["alive"]:
+        return None
+
+    player["alive"] = False
+    old_role = player["role"]
+    new_doctor = None
+
+    if old_role == "دكتور":
+        new_doctor = transfer_doctor(room)
+
+    return {
+        "name": player["name"],
+        "role": old_role,
+        "new_doctor": new_doctor
+    }
+
+def check_winner(code):
+    room = get_room(code)
+    if not room:
+        return True
+
+    alive = alive_players(room)
+    mafia = sum(
+        room["players"][sid]["role"] == "مافيا"
+        for sid in alive
+    )
+    town = len(alive) - mafia
+
+    if mafia == 0:
+        room["phase"] = "ended"
+        room["message"] = "🏆 فاز المواطنون!"
+    elif mafia >= town:
+        room["phase"] = "ended"
+        room["message"] = "🏆 فازت المافيا!"
+
+    if room["phase"] == "ended":
+        update_room(code)
+        return True
+
+    return False
+
+def begin_night(code):
+    room = get_room(code)
+    if not room:
+        return
+
+    room["phase"] = "night"
+    room["round"] += 1
+    room["message"] = "🌙 حلّ الليل... المافيا والدكتور يختارون"
+    room["mafia_target"] = None
+    room["doctor_target"] = None
+    room["deadline"] = time.time() + 30
+
+    mafia = [
+        sid for sid in alive_players(room)
+        if room["players"][sid]["role"] == "مافيا"
+    ]
+    room["captain"] = random.choice(mafia) if mafia else None
+
+    update_room(code)
+    socketio.start_background_task(night_timer, code, room["round"])
+
+def night_timer(code, round_number):
+    socketio.sleep(30)
+    room = get_room(code)
+    if room and room["phase"] == "night" and room["round"] == round_number:
+        resolve_night(code)
+
+def resolve_night(code):
+    room = get_room(code)
+    if not room or room["phase"] != "night":
+        return
+
+    victim = room["mafia_target"]
+    protected = room["doctor_target"]
+    message = "🌅 انتهى الليل."
+
+    if victim and victim == protected:
+        message = "🛡️ نجح الدكتور في حماية الضحية!"
+        notice(victim, "تمت حمايتك!")
+    elif victim:
+        result = eliminate(code, victim)
+        if result:
+            message = (
+                f"🌅 تم العثور على {result['name']} خارج اللعبة. "
+                f"كان دوره: {result['role']}"
+            )
+            if result["new_doctor"]:
+                message += " وانتقل دور الدكتور إلى لاعب جديد."
+    else:
+        message = "🌅 لم يتم تنفيذ عملية اغتيال."
+
+    room["message"] = message
+
+    if check_winner(code):
+        return
+
+    begin_discussion(code)
+
+def begin_discussion(code):
+    room = get_room(code)
+    if not room:
+        return
+
+    room["phase"] = "discussion"
+    room["message"] = "☀️ وقت المناقشة! تحدثوا واكتشفوا المافيا."
+    room["deadline"] = time.time() + 120
+    update_room(code)
+    socketio.start_background_task(
+        discussion_timer, code, room["round"]
+    )
+
+def discussion_timer(code, round_number):
+    socketio.sleep(120)
+    room = get_room(code)
+    if room and room["phase"] == "discussion" and room["round"] == round_number:
+        begin_vote(code)
+
+def begin_vote(code):
+    room = get_room(code)
+    if not room:
+        return
+
+    room["phase"] = "vote"
+    room["votes"] = {}
+    room["message"] = "🗳️ حان وقت التصويت! اختر لاعباً أو تخطَّ."
+    room["deadline"] = time.time() + 30
+    update_room(code)
+    socketio.start_background_task(vote_timer, code, room["round"])
+
+def vote_timer(code, round_number):
+    socketio.sleep(30)
+    room = get_room(code)
+    if room and room["phase"] == "vote" and room["round"] == round_number:
+        resolve_vote(code)
+
+def resolve_vote(code):
+    room = get_room(code)
+    if not room or room["phase"] != "vote":
+        return
+
+    counts = {}
+    for target in room["votes"].values():
+        counts[target] = counts.get(target, 0) + 1
+
+    if not counts:
+        room["message"] = "لم يصوت أحد. تم تخطي التصويت."
+    else:
+        highest = max(counts.values())
+        winners = [x for x, n in counts.items() if n == highest]
+
+        if "skip" in winners or len(winners) != 1:
+            room["message"] = "انتهى التصويت بالتخطي أو التعادل."
+        else:
+            target = winners[0]
+            if target == "skip":
+                room["message"] = "تم تخطي التصويت."
+            elif target in room["players"]:
+                result = eliminate(code, target)
+                if result:
+                    room["message"] = (
+                        f"تم إخراج {result['name']}. "
+                        f"كان دوره: {result['role']}"
+                    )
+                    if result["new_doctor"]:
+                        room["message"] += " وانتقل دور الدكتور إلى لاعب جديد."
+
+    if check_winner(code):
+        return
+
+    begin_night(code)
+
+@app.route("/")
+def home():
+    return render_template_string(PAGE)
+
+@socketio.on("create")
+def create(data):
+    name = str(data.get("name", "")).strip()[:18]
+    if not name:
+        notice(request.sid, "اكتب اسمك أولاً.")
+        return
+
+    code = "".join(
+        random.choices(string.ascii_uppercase + string.digits, k=6)
+    )
+    while code in rooms:
+        code = "".join(
+            random.choices(string.ascii_uppercase + string.digits, k=6)
+        )
+
+    rooms[code] = {
+        "host": request.sid,
+        "players": {},
+        "phase": "lobby",
+        "round": 0,
+        "message": "بانتظار انضمام اللاعبين...",
+        "deadline": 0,
+        "captain": None,
+        "mafia_target": None,
+        "doctor_target": None,
+        "votes": {}
+    }
+
+    add_player(code, request.sid, name)
+
+@socketio.on("join")
+def join(data):
+    code = str(data.get("code", "")).strip().upper()
+    name = str(data.get("name", "")).strip()[:18]
+    room = get_room(code)
+
+    if not room:
+        notice(request.sid, "كود الغرفة غير صحيح.")
+        return
+    if room["phase"] != "lobby":
+        notice(request.sid, "اللعبة بدأت بالفعل.")
+        return
+    if len(room["players"]) >= 16:
+        notice(request.sid, "الغرفة ممتلئة.")
+        return
+    if not name:
+        notice(request.sid, "اكتب اسمك.")
+        return
+    if any(p["name"] == name for p in room["players"].values()):
+        notice(request.sid, "هذا الاسم مستخدم.")
+        return
+
+    add_player(code, request.sid, name)
+
+def add_player(code, sid, name):
+    room = get_room(code)
+    if any(p["name"] == name for p in room["players"].values()):
+        notice(sid, "هذا الاسم مستخدم.")
+        return
+
+    join_room(code)
+    room["players"][sid] = {
+        "sid": sid,
+        "name": name,
+        "color": random.choice(COLORS),
+        "role": None,
+        "alive": True
+    }
+    update_room(code)
+
+@socketio.on("start")
+def start():
+    room_code = next(
+        (c for c, r in rooms.items() if request.sid in r["players"]),
+        None
+    )
+    room = get_room(room_code) if room_code else None
+
+    if not room or request.sid != room["host"]:
+        notice(request.sid, "صاحب الغرفة فقط يستطيع بدء اللعبة.")
+        return
+    if not 10 <= len(room["players"]) <= 16:
+        notice(request.sid, "تحتاج الغرفة إلى 10–16 لاعباً.")
+        return
+
+    ids = list(room["players"])
+    random.shuffle(ids)
+
+    mafia_count = 2 + (len(ids) - 10) // 3
+    roles = ["مافيا"] * mafia_count + ["دكتور"]
+    roles += ["مواطن"] * (len(ids) - mafia_count - 1)
+    random.shuffle(roles)
+
+    for sid, role in zip(ids, roles):
+        room["players"][sid]["role"] = role
+        room["players"][sid]["alive"] = True
+        private_role(sid, role)
+
+    begin_night(room_code)
+
+@socketio.on("action")
+def action(data):
+    room_code = next(
+        (c for c, r in rooms.items() if request.sid in r["players"]),
+        None
+    )
+    room = get_room(room_code) if room_code else None
+
+    if not room or request.sid not in room["players"]:
+        return
+
+    player = room["players"][request.sid]
+    if not player["alive"]:
+        notice(request.sid, "أنت خارج اللعبة.")
+        return
+
+    target = str(data.get("target", ""))
+    if target != "skip" and (
+        target not in room["players"]
+        or not room["players"][target]["alive"]
+    ):
+        return
+
+    if room["phase"] == "night":
+        if player["role"] == "مافيا" and request.sid == room["captain"]:
+            if target == "skip" or room["players"][target]["role"] == "مافيا":
+                notice(request.sid, "اختر لاعباً ليس من المافيا.")
+                return
+            room["mafia_target"] = target
+            notice(request.sid, "تم تسجيل اختيار المافيا.")
+        elif player["role"] == "دكتور":
+            if target == "skip":
+                return
+            room["doctor_target"] = target
+            notice(request.sid, "تم تسجيل اختيار الحماية.")
+        else:
+            return
+
+        if room["mafia_target"] and room["doctor_target"]:
+            resolve_night(room_code)
+
+    elif room["phase"] == "vote":
+        if target != "skip" and target == request.sid:
+            notice(request.sid, "لا يمكنك التصويت لنفسك.")
+            return
+
+        room["votes"][request.sid] = target
+        notice(request.sid, "تم تسجيل صوتك.")
+
+        if len(room["votes"]) >= len(alive_players(room)):
+            resolve_vote(room_code)
+
+    update_room(room_code)
+
+from flask import request
+
+PAGE = r"""
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MAFIA ONLINE</title>
+<script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#10131c;color:#fff;font-family:Arial,sans-serif}
+main{max-width:520px;margin:auto;padding:25px 18px}
+h1{text-align:center;font-size:48px;color:#f04452;letter-spacing:5px}
+.sub{text-align:center;color:#939caf;margin-bottom:35px}
+.panel{background:#1a2030;border:1px solid #30394d;border-radius:18px;padding:20px;margin:15px 0}
+input{width:100%;padding:15px;margin:7px 0;background:#101622;border:1px solid #394258;border-radius:10px;color:white;font-size:17px}
+button{width:100%;padding:15px;margin:7px 0;border:0;border-radius:10px;background:#e94452;color:white;font-size:17px;font-weight:bold}
+button.secondary{background:#303b51}
+button:disabled{opacity:.4}
+.hidden{display:none}
+.player{display:flex;align-items:center;gap:12px;padding:12px;background:#252d40;border-radius:10px;margin:8px 0}
+.dot{width:13px;height:13px;border-radius:50%}
+.dead{opacity:.35;text-decoration:line-through}
+#message{font-size:19px;text-align:center;line-height:1.7}
+#role{font-size:25px;text-align:center;color:#ffd65a}
+.small{color:#9ca8bb;text-align:center;font-size:13px}
+#timer{text-align:center;font-size:25px;color:#ffd65a}
+</style>
+</head>
+<body>
+<main>
+<h1>MAFIA</h1>
+<p class="sub">ثق بالجميع... أو لا تثق بأحد</p>
+
+<section id="home" class="panel">
+<h2>ابدأ اللعب</h2>
+<input id="name" placeholder="اكتب اسمك">
+<button onclick="createRoom()">إنشاء غرفة</button>
+<hr style="border-color:#30394d;margin:20px 0">
+<input id="code" placeholder="كود الغرفة">
+<button class="secondary" onclick="joinRoom()">دخول غرفة</button>
+<p class="small">من 10 إلى 16 لاعباً</p>
+</section>
+
+<section id="game" class="hidden">
+<div class="panel">
+<p class="small">كود الغرفة</p>
+<h2 id="roomcode" style="text-align:center;letter-spacing:5px"></h2>
+<button class="secondary" onclick="copyCode()">نسخ الكود</button>
+<div id="role"></div>
+<div id="message"></div>
+<div id="timer"></div>
+</div>
+<div class="panel">
+<h3>اللاعبون</h3>
+<div id="players"></div>
+<button id="start" class="hidden" onclick="socket.emit('start')">ابدأ اللعبة</button>
+</div>
+<div id="actions" class="panel hidden">
+<h3 id="actionTitle">اختيار</h3>
+<div id="choices"></div>
+</div>
+</section>
+</main>
+<script>
+const socket=io();
+let myRole="",myState=null,roomCode="";
+function createRoom(){
+ const name=document.getElementById("name").value.trim();
+ socket.emit("create",{name});
+}
+function joinRoom(){
+ const name=document.getElementById("name").value.trim();
+ const code=document.getElementById("code").value.trim();
+ socket.emit("join",{name,code});
+}
+function copyCode(){
+ navigator.clipboard.writeText(roomCode);
+ alert("تم نسخ الكود");
+}
+function esc(s){
+ return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+socket.on("notice",m=>alert(m));
+socket.on("role",r=>{
+ myRole=r;
+ document.getElementById("role").textContent="دورك: "+r;
+});
+socket.on("state",s=>{
+ myState=s;
+ roomCode=s.code;
+ document.getElementById("home").classList.add("hidden");
+ document.getElementById("game").classList.remove("hidden");
+ document.getElementById("roomcode").textContent=s.code;
+ document.getElementById("message").textContent=s.message;
+ document.getElementById("start").classList.toggle("hidden",!s.is_host||s.phase!=="lobby");
+ document.getElementById("players").innerHTML=s.players.map(p=>
+ `<div class="player ${p.alive?'':'dead'}"><span class="dot" style="background:${p.color}"></span>${esc(p.name)} ${p.alive?'':'(خارج اللعبة)'}</div>`
+ ).join("");
+ renderActions(s);
+});
+function renderActions(s){
+ const box=document.getElementById("actions");
+ const choices=document.getElementById("choices");
+ box.classList.add("hidden");
+ choices.innerHTML="";
+ if(s.phase==="night"&&s.is_captain&&myRole==="مافيا"){
+  showChoices("اختر ضحية المافيا",s.players.filter(p=>p.alive),false);
+ }else if(s.phase==="night"&&myRole==="دكتور"){
+  showChoices("اختر من تريد حمايته",s.players.filter(p=>p.alive),false);
+ }else if(s.phase==="vote"){
+  showChoices("صوّت على لاعب",s.players.filter(p=>p.alive),true);
+ }
+}
+function showChoices(title,players,skip){
+ const box=document.getElementById("actions");
+ document.getElementById("actionTitle").textContent=title;
+ box.classList.remove("hidden");
+ const choices=document.getElementById("choices");
+ players.forEach(p=>{
+  const b=document.createElement("button");
+  b.className="secondary";
+  b.textContent=p.name;
+  b.onclick=()=>socket.emit("action",{target:findSid(p.name)});
+  choices.appendChild(b);
+ });
+ if(skip){
+  const b=document.createElement("button");
+  b.textContent="تخطي التصويت";
+  b.className="secondary";
+  b.onclick=()=>socket.emit("action",{target:"skip"});
+  choices.appendChild(b);
+ }
+}
+function findSid(name){
+ // يرسل السيرفر معرّف اللاعب في نسخة قائمة الاختيارات
+ return "";
+}
+setInterval(()=>{
+ if(!myState||!myState.deadline)return;
+ const left=Math.max(0,Math.ceil(myState.deadline-Date.now()/1000));
+ document.getElementById("timer").textContent=left+" ثانية";
+},500);
+</script>
+</body>
+</html>
+"""
+
+if __name__ == "__main__":
+    socketio.run(app, host="0.0.0.0", port=5000)
